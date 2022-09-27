@@ -1,0 +1,1543 @@
+class OrderTrack(order_track_mixins.OrderTrackStatusMixin, BaseSuperModel):
+    order = models.ForeignKey(
+        "orders.Order",
+        related_name="history",
+        verbose_name="Pedido",
+        on_delete=models.CASCADE,
+    )
+    status = FSMIntegerField(
+        choices=order_track_mixins.OrderTrackStatusMixin.TRACK_STATUS,
+        verbose_name="Status do Pedido",
+        default=order_track_mixins.OrderTrackStatusMixin.STATUS_CART,
+    )
+    note = models.TextField("Nota", blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="created_by",
+        verbose_name="Criado por",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        default=None,
+    )
+
+    class Meta:
+        verbose_name = "Histórico do Pedido"
+        verbose_name_plural = "Histórico dos Pedidos"
+        ordering = ("created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["order", "status"],
+                condition=(
+                    models.Q(deleted=False)
+                    & ~models.Q(
+                        status__in=order_track_mixins.OrderTrackStatusMixin.REPEATABLE_STATUSES
+                    )
+                ),
+                name="unique_ordertrack_order_status_no_deleted",
+            )
+        ]
+
+    def __str__(self):
+        local_date = timezone.localtime(self.created_at)
+        local_date_string = local_date.strftime("%d/%m/%Y - %H:%M")
+        return f"Status: {self.get_status_display()} | Data/Hora: {local_date_string}"
+
+
+class Order(
+    order_mixins.StoreCurrentOrderValuesMixin,
+    additionals_mixins.OrderAdditionalMixin,
+    transitions_mixins.OrderStatusTransitionsMixin,
+    product_exchange_mixins.ProductExchangeMixin,
+    BaseSuperModel,
+):
+    DELIVERY_TYPES = (
+        ("pickup", "Buscar na Loja"),
+        ("delivery", "Entregar à domicílio"),
+    )
+    PLATFORM_TYPES = (
+        (None, "Desconhecido"),
+        (1, "Android"),
+        (2, "IOS"),
+        (3, "E-COMMERCE"),
+    )
+    viewed_at = models.DateTimeField(blank=True, null=True)
+
+    market = models.ForeignKey(Market, verbose_name="Mercado", on_delete=models.CASCADE)
+    origin_market = models.ForeignKey(
+        Market,
+        verbose_name="Mercado de origem",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="order_origin_market",
+    )
+
+    distribution_center = models.ForeignKey(
+        Market,
+        verbose_name="Centro de distribuição",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="order_distribution_center",
+    )
+
+    # [B2B] Estabelecimento de destino do pedido do revendedor
+    reseller_establishment = models.ForeignKey(
+        Establishment,
+        verbose_name="Estabelecimento de destino do pedido",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    external_code = models.CharField(
+        verbose_name="Código externo", max_length=255, null=True, blank=True,
+    )
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        verbose_name="Cliente",
+        on_delete=models.SET_NULL,
+        null=True,
+    )
+    user_data = JSONField("Dados do Usuário", null=True, encoder=DjangoJSONEncoder)
+    ordered_at = models.DateTimeField(
+        verbose_name="Finalizado às", blank=True, null=True, default=None
+    )
+    consolidated = models.BooleanField("Dados consolidados", default=False)
+    order_number = models.BigIntegerField(
+        "Número do pedido", unique=False, blank=True, null=True, default=None
+    )
+    order_number_sequential = models.IntegerField(null=True, blank=True)
+    status = FSMIntegerField(
+        choices=OrderTrack.TRACK_STATUS,
+        verbose_name="Status do Pedido",
+        default=OrderTrack.STATUS_CART,
+        db_index=True,
+    )
+    delivery_option = models.PositiveSmallIntegerField(
+        choices=DeliveryOptionMixin.DELIVERY_OPTIONS,
+        verbose_name="Opção de entrega",
+        blank=True,
+        null=True,
+    )
+
+    title = models.CharField("Título", max_length=100, blank=True, default="")
+
+    # delivery
+    delivery_type = models.CharField(
+        verbose_name="Tipo de Entrega",
+        choices=DELIVERY_TYPES,
+        max_length=20,
+        default="delivery",
+    )
+    shipping_address = models.ForeignKey(
+        ShippingAddress,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        verbose_name="Endereço de entrega",
+    )
+    shipping_data = JSONField("Dados de Entrega", null=True, encoder=DjangoJSONEncoder)
+    payment_method = models.ForeignKey(
+        PaymentMethod,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        verbose_name="Metodo de pagamento",
+    )
+    payment_data = JSONField("Dados de pagamento", null=True, encoder=DjangoJSONEncoder)
+    payment_type = models.CharField(
+        choices=PAYMENT_TYPES_CHOICES,
+        max_length=100,
+        default=PAYMENT_TYPE_ONLINE,
+        blank=True,
+    )
+
+    # collect
+    collected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="gathereds",
+        verbose_name="Coletor",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        default=None,
+    )
+    collected_at = models.DateTimeField(
+        verbose_name="Coletado às", blank=True, null=True, default=None
+    )
+    packages = models.IntegerField("Pacotes utilizados", default=0, blank=True)
+    packages_refrigerated = models.IntegerField(
+        "Pacotes utilizados refrigerados", default=0, blank=True
+    )
+
+    reviews = GenericRelation(Review)
+
+    total_weight = models.IntegerField(
+        verbose_name="Peso total do pedido", null=True, blank=True
+    )
+    full_price = models.DecimalField(
+        verbose_name="Valor inicial do pedido",
+        max_digits=11,
+        decimal_places=3,
+        null=True,
+        blank=True,
+    )
+    total_price = models.DecimalField(
+        verbose_name="Total do Pedido",
+        max_digits=11,
+        decimal_places=3,
+        null=True,
+        blank=True,
+    )
+    service_tax = models.DecimalField(
+        verbose_name="Taxa de serviço",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    service_tax_discount = models.DecimalField(
+        verbose_name="Desconto na taxa de serviço",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    service_tax_total = models.DecimalField(
+        verbose_name="Taxa de serviço final",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    super_tax = models.DecimalField(
+        verbose_name="Taxa total",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    total_aditional = models.DecimalField(
+        verbose_name="Valor total de impostos",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    is_c2c_order = models.BooleanField(
+        verbose_name="Pedido parceiro mais", default=False
+    )
+    sync_qrsorteio = models.BooleanField(
+        verbose_name="Cupom Enviado para QR", default=False
+    )
+    commission_total = models.DecimalField(
+        verbose_name="Comissão parceiro mais",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    delivery_tax = models.DecimalField(
+        verbose_name="Taxa de entrega",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    delivery_tax_discount = models.DecimalField(
+        verbose_name="Desconto na taxa de entrega",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    delivery_tax_total = models.DecimalField(
+        verbose_name="Taxa de entrega final",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    total_price_with_tax = models.DecimalField(
+        verbose_name="Total + Taxa",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    total_discounts = models.DecimalField(
+        verbose_name="Desconto total",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    total_items_count = models.IntegerField(
+        verbose_name="Total de itens do pedido", null=True, blank=True
+    )
+    occurrences_count = models.IntegerField(
+        verbose_name="Total de itens com ocorrencias", null=True, blank=True
+    )
+    occurence_action = models.CharField(
+        "Ação em caso de ocorrência",
+        max_length=80,
+        choices=occurence_mixins.ActionsMixin.USER_ACTION_CHOICES,
+        blank=True,
+        null=True,
+    )
+    items_collected_count = models.IntegerField(
+        verbose_name="Total de itens coletados", null=True, blank=True
+    )
+    missing_collection_count = models.IntegerField(
+        verbose_name="Total de itens a coletar", null=True, blank=True
+    )
+    callback_sent_at = models.DateTimeField(
+        verbose_name="Data e hora de envio ao callback", null=True, blank=True
+    )
+    callback_response = models.TextField(null=True, blank=True)
+
+    af_response = JSONField(verbose_name="Propriedades", blank=True, null=True)
+
+    verify_credentials_required = models.BooleanField(
+        verbose_name="Verificar documentos", null=True, default=False
+    )
+
+    installments = models.PositiveIntegerField("Parcelas", default=1)
+    summary_email_sent = models.BooleanField(
+        verbose_name="Email de resumo enviado", default=False, null=True
+    )
+    read_lock = models.BooleanField(
+        default=False,
+        verbose_name="Bloqueio de leitura",
+        help_text="Esse bloqueio é ativado automaticamente quando o pedido é lido pelo estabelecimento via plataforma de integração, se ativado, não será possível refazer a leitura.",
+    )
+    collection_lock = models.BooleanField(
+        default=False,
+        verbose_name="Bloqueio de coleta",
+        help_text="Esse bloqueio é ativado automaticamente quando o pedido entra em coleta. Se ativado, não será possível reiniciar a coleta.",
+    )
+
+    point_of_sale_response = JSONField(null=True, blank=True)
+
+    delivery_tax_free = models.BooleanField(
+        null=True, verbose_name="Frete grátis", default=False
+    )
+    is_payment_on_pickup_order = models.BooleanField(
+        verbose_name="Pagamento na Retirada", default=False, null=True, blank=True
+    )
+    platform = models.IntegerField(
+        "Front-End", choices=PLATFORM_TYPES, null=True, blank=True
+    )
+    cancel_in_market = models.BooleanField(
+        null=True, verbose_name="Cancelar ao chegar no mercado", default=False
+    )
+
+    verification_code = models.CharField(
+        verbose_name="Código de Verificacao",
+        max_length=10,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+
+    cpf_on_invoice = models.BooleanField(
+        verbose_name="Colocar CPF na nota", null=True, default=True
+    )
+    seller_token = models.CharField(
+        verbose_name="Codigo do Vendedor RCA",
+        max_length=10,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+
+    is_external_sale = models.BooleanField(
+        verbose_name="Pedido via venda externa", default=False
+    )
+
+    delivery_state = models.CharField(
+        verbose_name="Estado de precificação",
+        max_length=25,
+        blank=True,
+        null=True,
+        choices=br_states.STATE_CHOICES,
+    )
+    amount_voided_after_delivery = models.DecimalField(
+        verbose_name="Valor estornado após entrega",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+
+    phone_contact = models.BooleanField(
+        verbose_name="Contato Telefônico", default=False
+    )
+
+    vote_confidence = models.BooleanField(
+        verbose_name="Voto de confiança", default=False
+    )
+
+    tmp_coordinates = None
+
+    objects = OrderManager()
+
+    class Meta:
+        verbose_name = "Pedido"
+        verbose_name_plural = "Pedidos"
+        ordering = ("-ordered_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["order_number"],
+                name="order_number_unique",
+                condition=models.Q(deleted=False),
+            ),
+            models.UniqueConstraint(
+                fields=["market", "user"],
+                name="market_user_unique",
+                condition=models.Q(
+                    deleted=False,
+                    status=OrderTrack.STATUS_CART,
+                    distribution_center=None,
+                    origin_market=None,
+                ),
+            ),
+        ]
+
+    def get_corporate_user(self):
+        return self.user.person.first()
+
+    def get_cart_items_count(self):
+        return self.get_total_items_count()
+
+    def get_company(self):
+        if self.get_corporate_user():
+            company = self.get_corporate_user().company
+            setattr(company, "cpf", company.cnpj)
+            return company
+        return ""
+
+    def get_order_initial_user(self):
+        if self.get_company():
+            return self.get_corporate_user()
+        return self.user
+
+    def get_order_user(self, initial_user=False):
+        company = self.get_company()
+        if self.is_c2c_order and not initial_user:
+            return self.c2c_customer
+        elif company:
+            if initial_user:
+                return self.get_corporate_user()
+            return company
+        else:
+            return self.user
+
+    def get_type_of_sale(self):
+        if self.is_c2c_order:
+            return "Parceiro Mais"
+        elif self.get_company():
+            return "Representante"
+        else:
+            return "Cliente"
+
+    def get_order_delivery_address(self, nfe=False):
+        company = self.get_company()
+        if self.is_c2c_order and self.delivery_type == "delivery":
+            return self.delivery_address_order
+        elif self.is_c2c_order and self.delivery_type == "pickup":
+            return self.market
+        elif company and nfe:
+            return company
+        elif self.shipping_address:
+            return self.shipping_address
+        else:
+            return self.market
+
+    def create_commission_payment(self):
+        from super.c2c.models import CommissionPayment
+
+        # TODO VERIFICAR SE O PEDIDO FOI ENTREGUE
+        if (
+            self.is_c2c_order
+            and self.commission_total
+            and not hasattr(self, "commission_payment")
+        ):
+            CommissionPayment.objects.create(
+                order=self, commission=self.commission_total
+            )
+            return True
+        return False
+
+    def get_calculated_commission(self):
+        total = Decimal(0.0)
+
+        market = self.market
+
+        if not market.c2c_has_seller_commission:
+            return total
+
+        if market.virtual_store_from:
+            market = market.virtual_store_from
+
+        if not market.category.c2c_has_seller_commission:
+            return total
+
+        for item in self.items.all():
+            total += item.get_calculated_commission()
+
+        return total
+
+    def __str__(self):
+        return f"Pedido: {self.order_number} | Status: {self.get_status_display()} | Peso: {self.total_weight}"
+
+    def get_order_history(self):
+        return self.history.all()
+
+    def get_history_status(self):
+        try:
+            return self.history.latest()
+
+        except OrderTrack.DoesNotExist:
+            return None
+
+    def get_last_datetime(self, is_admin=True):
+        local_date = None
+        if self.history.last().created_at:
+            local_date = timezone.localtime(self.history.last().created_at)
+            if is_admin:
+                return local_date.strftime("%d/%m/%Y - %H:%M")
+        return local_date
+
+    def get_installment(self):
+        if self.market.is_electro and self.total_price_with_tax >= 100:
+            max_installment = 10
+        elif self.total_price_with_tax >= 20:
+            max_installment = 3
+        else:
+            max_installment = 2
+
+        installments = []
+        for i in range(1, max_installment + 1):
+            installments.append(
+                {"quantity": i, "value": round(self.total_price_with_tax / i, 2)}
+            )
+        return installments
+
+    def is_all_collected(self):
+        return self.get_missing_collection_count() < 1
+
+    def can_cancel_b2c_order(self):
+        """Cancela tenta cancelar o pagamento no wms
+        caso o status ainda permita cancelar, se não for
+        possivel executar a operação, seta á flag no pedido para
+        cancelar ao chegar no drive.
+        """
+        if self.distribution_center and self.external_code:
+            url = settings.B2C_CANCEL_URL
+            payload = {"idUsuario": 260, "idPedido": self.external_code}
+            try:
+                response = requests.post(url, payload)
+                if not response.ok:
+                    raise ValueError("Não é possivel cancelar o pedido!")
+            except Exception as err:
+                logger.info(f"[ERRO AO CANCELAR PEDIDO B2C] Order:{self.id}, {err}")
+                self.cancel_in_market = True
+                self.save(update_fields=["cancel_in_market"])
+
+    def cancel(self, canceled_by="merchant", created_by=None):
+        self.can_cancel_b2c_order()
+        for payment in self.payments.all():
+            payment.cancel(canceled_by=canceled_by, created_by=created_by)
+
+    def set_status(self, new_status, note=None, created_by=None):
+        extra_data = {}
+        self.refresh_from_db()
+        if note:
+            extra_data["note"] = note
+        if created_by:
+            extra_data["created_by"] = created_by
+
+        self.status = new_status
+
+        if not self.has_status(self.status):
+            order_history = OrderTrack.objects.create(
+                order=self, status=self.status, **extra_data
+            )
+
+            logger.info(
+                f"Gerando OrderTrack, id:{order_history.id}, status_id:{order_history.status}, método: set_status, pedido_id: {self.id}, status_pedido_id: {self.status}"
+            )
+
+        self.save()
+
+        return True
+
+    def set_status_market_received(self, note=None, created_by=None):
+        return self.set_status(
+            OrderTrackStatusMixin.STATUS_DISTRIBUTION_CENTER_ORDER_RECEIVED_IN_MARKET,
+            note,
+            created_by,
+        )
+
+    def set_status_collected(self, note=None, created_by=None):
+        return self.set_status(
+            OrderTrackStatusMixin.STATUS_COLLECTED, note, created_by,
+        )
+
+    def generate_verification_code(self):
+        number = random.randint(1000, 9999)
+        return str(number)
+
+    def save(self, *args, **kwargs):
+        if (
+            self.status
+            in [
+                OrderTrack.STATUS_PAYMENT_ANALISIS,
+                OrderTrack.STATUS_PAYMENT_PENDING,
+                OrderTrack.STATUS_ORDER_ONLY_RECEIVED,
+            ]
+            and not self.consolidated
+        ):
+            self.consolidated = True
+            self.ordered_at = timezone.now().astimezone(tz(settings.TIME_ZONE))
+            self.verification_code = self.generate_verification_code()
+
+        if self.ordered_at:
+            if not self.order_number:
+                date_part = int(timezone.now().today().strftime("%Y%m%d"))
+                number_part = get_next_value("order_numbers")
+                self.order_number = int(f"{date_part}{number_part}")
+
+            if (
+                not self.order_number_sequential
+                or self.order_number_sequential < 110000
+            ):
+                self.order_number_sequential = get_next_value(
+                    "order_number_sequential", initial_value=110000
+                )
+
+        super().save(*args, **kwargs)
+
+        cache.delete(f"order_detail_{self.pk}")
+
+    def get_market_payments(self, super_payment=False):
+        return self.payments.filter(super_payment=super_payment)
+
+    def is_accepted(self):
+        return self.history.filter(status=OrderTrack.STATUS_ACCEPTED).exists()
+
+    def is_out_for_delivery(self):
+        return self.history.filter(status=OrderTrack.STATUS_OUT_FOR_DELIVERY).exists()
+
+    def is_delivered(self):
+        return self.history.filter(status=OrderTrack.STATUS_DELIVERED).exists()
+
+    def is_canceled(self):
+        return self.history.filter(
+            status__in=[
+                OrderTrack.STATUS_CANCELED_BY_CUSTOMER,
+                OrderTrack.STATUS_CANCELED_BY_MERCHANT,
+                OrderTrack.STATUS_CANCELED_BY_DASHBOARD_AF,
+            ]
+        ).exists()
+
+    def get_cancel_reason(self):
+        cancel_history = self.history.filter(
+            status__in=[
+                OrderTrack.STATUS_CANCELED_BY_CUSTOMER,
+                OrderTrack.STATUS_CANCELED_BY_MERCHANT,
+                OrderTrack.STATUS_CANCELED_BY_DASHBOARD_AF,
+            ]
+        )
+
+        for status in cancel_history:
+            if status.note:
+                return status.note
+
+        return ""
+
+    def get_shipping_distance(self):
+        try:
+
+            coordinates = (
+                self.delivery_address_order.coordinates
+                if self.is_c2c_order and hasattr(self, "delivery_address_order")
+                else self.shipping_address.coordinates
+            )
+
+            if not all([self.market.coordinates, coordinates,]):
+                return 0
+
+            return float(self.market.coordinates.distance(coordinates) * 100)
+        except AttributeError:
+            return 0
+
+    def _get_payment(self, payment, delivery_tax=False, payment_without_tax=False):
+        return_data = {}
+        if payment and payment.transaction_response:
+            bin_number = payment.bin
+            provider = payment.provider
+            if payment.provider == "cashback":
+                payment_type = "cashback"
+                credit_card = None
+                identifier = payment.transaction_response["authorizationCode"]
+
+            elif payment.provider == "vr":
+                payment_type = "debitcard"
+                credit_card = None
+                identifier = (
+                    payment.capture_response["codigo_autorizacao"]
+                    if payment.capture_response
+                    else payment.transaction_response["codigo_autorizacao"]
+                )
+                if payment.order.is_c2c_order:
+                    bin_number = payment.order.c2c_payment.bin_number
+                else:
+                    bin_number = payment.order.payment_method.bin_number
+
+            elif payment.provider == "pix":
+                payment_type = "pix"
+                credit_card = None
+                identifier = ""
+
+            elif payment.provider == "crednosso":
+                payment_type = "creditcard"
+                identifier = payment.transaction_response["nrNsuHost"]
+                credit_card = {
+                    "card_number": payment.transaction_response["extraData"][
+                        "cardNumber"
+                    ],
+                    "holder": payment.transaction_response["extraData"]["holder"],
+                    "Brand": "Crednosso",
+                }
+            elif payment.provider == "cdc":
+                provider = "semear"
+                bin_number = "0"
+                payment_type = "financiamento"
+                identifier = payment.tid
+                credit_card = None
+
+            else:
+                payment_type = "creditcard"
+                identifier = payment.transaction_response["Payment"]["ProofOfSale"]
+
+                credit_card = {
+                    re.sub(r"(?<!^)(?=[A-Z])", "_", k).lower(): v
+                    for k, v in payment.transaction_response["Payment"][
+                        "CreditCard"
+                    ].items()
+                }
+
+            amount = payment.captured_amount or payment.amount
+
+            if delivery_tax:
+                amount = payment.delivery_tax
+
+            if payment_without_tax:
+                amount = amount - payment.delivery_tax
+            return_data.update(
+                {
+                    "provider": provider,
+                    "identifier": identifier,
+                    "tid": payment.tid,
+                    "value": str(round(amount, 2)),
+                    "status": payment.short_status,
+                    "installments": payment.installments,
+                    "bin": bin_number,
+                    "type": payment_type,  # mudar de acordo com tipo: creditcard | cashback
+                    "credit_card": credit_card,
+                    "tax_payment": payment.super_payment
+                    or delivery_tax
+                    or payment.only_tax,
+                }
+            )
+            return return_data
+
+        return {}
+
+    def _get_b2b_payment(self, payment, delivery_tax=False, payment_without_tax=False):
+        return_data = {}
+        collect_agent_id = {
+            "cielo": 598,
+            "crednosso": 598,
+            "pix": 1187,
+            "vr": 400,
+            "cashback": "",
+            "retirada": "",
+            "ticket": "",
+            "cdc": "",
+            "boleto_mateus": "",
+            "local": "",
+        }
+        if payment and payment.transaction_response:
+            vr_bin_number = None
+
+            collect_agent = collect_agent_id[payment.provider]
+            return_data.update(
+                {
+                    "collection_agent": str(collect_agent),
+                    "payment_deadline": str(collect_agent),
+                }
+            )
+            if payment.provider == "cashback":
+                payment_type = "cashback"
+                credit_card = None
+                identifier = payment.transaction_response["authorizationCode"]
+
+            elif payment.provider == "vr":
+                payment_type = "debitcard"
+                credit_card = None
+                identifier = payment.transaction_response["codigo_autorizacao"]
+                if payment.order.is_c2c_order:
+                    vr_bin_number = payment.order.c2c_payment.bin_number
+                else:
+                    vr_bin_number = payment.order.payment_method.bin_number
+                deadline_and_agent = self.get_deadline_and_agent(payment)
+                return_data.update(deadline_and_agent)
+
+            elif payment.provider == "pix":
+                payment_type = "pix"
+                credit_card = None
+                identifier = ""
+                deadline_and_agent = self.get_deadline_and_agent(payment)
+                return_data.update(deadline_and_agent)
+
+            elif payment.provider == "boleto_mateus":
+                payment_type = "boleto_mateus"
+                credit_card = None
+                identifier = ""
+                deadline_and_agent = self.get_deadline_and_agent(payment)
+                return_data.update(deadline_and_agent)
+            elif payment.provider == "crednosso":
+                payment_type = "creditcard"
+                identifier = payment.transaction_response["nrNsuHost"]
+                credit_card = {
+                    "card_number": payment.transaction_response["extraData"][
+                        "cardNumber"
+                    ],
+                    "holder": payment.transaction_response["extraData"]["holder"],
+                    "Brand": "Crednosso",
+                }
+                deadline_and_agent = self.get_deadline_and_agent(payment)
+                return_data.update(deadline_and_agent)
+            else:
+                payment_type = "creditcard"
+                identifier = payment.transaction_response["Payment"]["ProofOfSale"]
+
+                credit_card = {
+                    re.sub(r"(?<!^)(?=[A-Z])", "_", k).lower(): v
+                    for k, v in payment.transaction_response["Payment"][
+                        "CreditCard"
+                    ].items()
+                }
+                deadline_and_agent = self.get_deadline_and_agent(payment)
+                return_data.update(deadline_and_agent)
+
+            amount = payment.captured_amount or payment.amount
+
+            if delivery_tax:
+                amount = payment.delivery_tax
+
+            if payment_without_tax:
+                amount = amount - payment.delivery_tax
+
+            if not payment.provider == "boleto_mateus":
+                return_data.update({"installments": payment.installments})
+
+            return_data.update(
+                {
+                    "provider": payment.provider,
+                    "identifier": identifier,
+                    "tid": payment.tid,
+                    "value": str(round(amount, 2)),
+                    "status": payment.short_status,
+                    "bin": vr_bin_number or payment.bin,
+                    "type": payment_type,  # mudar de acordo com tipo: creditcard | cashback
+                    "credit_card": credit_card,
+                    "tax_payment": payment.super_payment
+                    or delivery_tax
+                    or payment.only_tax,
+                }
+            )
+            return return_data
+
+        return {}
+
+    def get_deadline_and_agent(self, payment):
+        from super.payments.models import PaymentDeadLine
+
+        deadline_internal_id = {
+            "cielo": 44,
+            "crednosso": 44,
+            "pix": 43,
+            "vr": 49,
+            "cashback": "",
+            "retirada": "",
+            "ticket": "",
+            "cdc": "",
+            "boleto_mateus": payment.payment_deadline.internal_id
+            if payment.payment_deadline
+            else None,
+            "local": "",
+        }
+        deadline_id = deadline_internal_id[payment.provider]
+        payment_deadline = PaymentDeadLine.objects.get(internal_id=deadline_id)
+        return {
+            "collection_agent": str(payment_deadline.collect_agent.internal_id),
+            "payment_deadline": str(deadline_id),
+            "installments": str(payment_deadline.installments),
+        }
+
+    # Para manter compatibilidade com os lugares que utilizam o cartão para mostrar infomação, mas precisa mudar em todos lugare e adaptar para multiplos meios de pagamentos
+    @property
+    def checkout_web_link(self):
+        CHECKOUT_WEB_URL = settings.CHECKOUT_WEB_URL
+
+        if not CHECKOUT_WEB_URL:
+            logger.error(
+                f"Erro ao criar web link checkout: {CHECKOUT_WEB_URL}{self.id}"
+            )
+
+        LINK_BASE = f"{CHECKOUT_WEB_URL}{self.id}"
+        return LINK_BASE
+
+    @property
+    def data_for_notify_c2c_link(self):
+        if hasattr(self, "c2c_customer"):
+            return {
+                "phone": self.c2c_customer.initial_phone,
+                "email": self.c2c_customer.initial_email,
+                "allowed": True,
+            }
+        return {}
+
+    @property
+    def data_for_notify(self):
+        person = self.get_corporate_user()
+        if person:
+            return {
+                "phone": person.phone,
+                "email": person.email,
+                "name": person.first_name,
+                "allowed": person.whatsapp_terms_accepted,
+                "order_number": self.order_number,
+            }
+
+        if not self.is_c2c_order:
+            return {
+                "phone": self.user.phone,
+                "email": self.user.email,
+                "name": self.user.first_name,
+                "allowed": self.user.whatsapp_terms_accepted,
+                "order_number": self.order_number,
+            }
+
+        if hasattr(self, "c2c_customer"):
+            return {
+                "phone": self.c2c_customer.phone,
+                "email": self.c2c_customer.email,
+                "name": self.c2c_customer.first_name,
+                "allowed": True,
+                "order_number": self.order_number,
+            }
+        return {}
+
+    @property
+    def get_payment(self):
+        payments = self.get_payments(super_payment=True)
+
+        if not payments:
+            payments = self.get_payments(super_payment=False)
+
+        return next(
+            (x for x in payments if x.get("provider") in ["cielo", "crednosso"]), None
+        )
+
+    # def get_authorized_payments(self):
+
+    def get_payments_to_pulse(self):
+        payments = []
+        payments_queryset = self.payments.filter(
+            tid__isnull=False,
+            status__in=[
+                0,  # PaymentStatus.TRANSACTION_CAPTURE_SUCCESS,
+                2,  # PaymentStatus.TRANSACTION_SUCCESS, reference circular, problem import PaymentStatus
+                9,  # PaymentStatus.TRANSACTION_ANALYSIS_APPROVED
+                10,  # PaymentStatus.TRANSACTION_SEND_BORDERO
+            ],
+            amount__gt=0,
+        )
+        for payment in payments_queryset:
+            if payment.provider == "boleto_mateus":
+                payments.extend(
+                    BoletoCreditoService.get_pulse_payload(
+                        payment,
+                        delivery_tax=payment.delivery_tax and payment.delivery_tax > 0,
+                        payment_without_tax=False,
+                    )
+                )
+                return payments
+            elif payment.only_tax:
+                payments.append(self._get_payment(payment))
+            elif payment.delivery_tax and payment.delivery_tax > 0:
+                payments.append(self._get_payment(payment, delivery_tax=True))
+                payments.append(self._get_payment(payment, payment_without_tax=True))
+            else:
+                payments.append(self._get_payment(payment))
+
+        return payments
+
+    def get_payments_b2b_to_pulse(self):
+        payments = []
+        payments_queryset = self.payments.filter(
+            tid__isnull=False,
+            status__in=[
+                0,  # PaymentStatus.TRANSACTION_CAPTURE_SUCCESS,
+                2,  # PaymentStatus.TRANSACTION_SUCCESS, reference circular, problem import PaymentStatus
+                9,  # PaymentStatus.TRANSACTION_ANALYSIS_APPROVED
+            ],
+            amount__gt=0,
+        )
+
+        for payment in payments_queryset:
+            if payment.only_tax:
+                payments.append(self._get_b2b_payment(payment))
+            elif payment.delivery_tax and payment.delivery_tax > 0:
+                payments.append(self._get_b2b_payment(payment, delivery_tax=True))
+                payments.append(
+                    self._get_b2b_payment(payment, payment_without_tax=True)
+                )
+            else:
+                payments.append(self._get_b2b_payment(payment))
+
+        return payments
+
+    def get_payments(self, super_payment=False, is_authorized=False):
+        payments = []
+        for payment in self.payments.filter(
+            tid__isnull=False,
+            super_payment=super_payment,
+            captured_amount__isnull=is_authorized,
+            status__in=[
+                0,  # PaymentStatus.TRANSACTION_CAPTURE_SUCCESS,
+                2,  # PaymentStatus.TRANSACTION_SUCCESS, reference circular, problem import PaymentStatus
+                4,  # PaymentStatus.TRANSACTION_CANCELED
+                9,  # PaymentStatus.TRANSACTION_ANALYSIS_APPROVED
+                11,  # PaymentStatus.TRANSACTION_ANALYSIS_REFUSED
+            ],
+            amount__gt=0,
+        ):
+
+            payments.append(self._get_payment(payment))
+        return payments
+
+    @property
+    def payments(self):
+        payments = self.get_payments(True)
+        payments + self.get_payments(False)
+        return payments
+
+    def has_payments_authorized(self):
+        return self.payments.filter(super_payment=False, status=0).exists()
+
+    def has_pix_payments_created(self):
+        return self.payments.filter(provider="pix", status__in=[0, 6]).exists()
+
+    def has_cdc_payments_created(self):
+        return self.payments.filter(provider="cdc", status__in=[0, 6]).exists()
+
+    def is_pix_payments_order(self):
+        if self.payments.filter(provider="pix").exclude(status=4).exists():
+            return True
+        return not self.history.filter(
+            status=OrderTrack.STATUS_PAYMENT_ANALISIS
+        ).exists()
+
+    def is_cdc_payments_order(self):
+        if self.payments.filter(provider="cdc").exists():
+            return True
+        return False
+
+    def is_pickup_payments_order(self):
+        return self.payments.filter(provider="returada").exists()
+
+    def expire_pix_payments(self):
+        for payment in self.payments.filter(provider="pix", status__in=[0, 6]):
+            payment.cancel(canceled_by="customer")
+
+    def cancel_pix_orders_track_pending(self):
+        self.history.filter(status=OrderTrack.STATUS_PAYMENT_PENDING).delete()
+
+    def has_status(self, status):
+        return self.history.filter(status=status).exists()
+
+    def update_order_items(self, force=False):
+        if self.status == OrderTrack.STATUS_CART or force:
+            return update_order_items(self)
+
+    def update_order_commission(self, save=False):
+        commission_total = Decimal(0.0)
+        if not self.is_c2c_order:
+            return commission_total
+
+        if not self.market.c2c_has_seller_commission:
+            return commission_total
+
+        for item in self.items.all():
+            commission_item = item.get_calculated_commission()
+            if commission_item == 0:
+                continue
+            item.commission = commission_item
+            commission_total += commission_item
+            item.save()
+        self.commission_total = commission_total
+        self.save()
+        return self.commission_total
+
+    def get_payment_approval_note(self):
+        """Retorna a nota de aprovação do pedido para consulta"""
+
+        if self.status == OrderTrack.STATUS_CANCELED_BY_MERCHANT:
+            return self.history.get(status=OrderTrack.STATUS_CANCELED_BY_MERCHANT).note
+        if self.status == OrderTrack.STATUS_CANCELED_BY_DASHBOARD_AF:
+            return self.history.get(
+                status=OrderTrack.STATUS_CANCELED_BY_DASHBOARD_AF
+            ).note
+        else:
+            history = self.history.filter(status=OrderTrack.STATUS_PAYMENT_CONFIRMED)
+            if history:
+                return history.first().note
+            return ""
+
+    def clear(self):
+        return self.items.all().delete()
+
+    def freeze_data(self):
+        self.user_data = model_to_dict(
+            self.user,
+            fields=[
+                "first_name",
+                "last_name",
+                "email",
+                "cpf",
+                "phone",
+                "date_joined",
+                "last_login",
+                "is_staff",
+                "is_active",
+                "super_buyer",
+            ],
+        )
+        if self.shipping_address:
+            self.shipping_data = model_to_dict(
+                self.shipping_address, exclude=["coordinates"]
+            )
+        if self.payment_method:
+            self.payment_data = model_to_dict(self.payment_method)
+            if self.payment_data.get("card_number"):
+                self.payment_data["card_number"] = self.payment_data["card_number"][-4:]
+
+    def is_data_frozen(self):
+        if self.delivery_type == "delivery" and not self.shipping_data:
+            return False
+        if not self.payment_data:
+            return False
+        return bool(self.user_data)
+
+    def is_boleto_mateus(self):
+        return self.payments.filter(provider="boleto_mateus").exists()
+
+    def external_payment_types(self):
+        return ["pix", "cashback", "vr", "cielo", "crednosso"]
+
+
+class OrderItem(BaseSuperModel):
+    # Begin: New fields from Product
+    name = models.CharField(verbose_name="Nome", max_length=255, null=True, blank=True)
+    brand = models.CharField(
+        verbose_name="Marca", max_length=255, null=True, blank=True
+    )
+    image = models.CharField(
+        verbose_name="Image", max_length=999, null=True, blank=True
+    )
+    weight = models.IntegerField(verbose_name="Peso", default=0)
+    measure = models.DecimalField(
+        verbose_name="Medida",
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        blank=True,
+        null=True,
+    )
+    measure_type = models.CharField(
+        verbose_name="Tipo de medida", max_length=255, blank=True
+    )
+    physical_location = models.CharField(
+        verbose_name="Localização Fisica No Mercado", max_length=255, blank=True
+    )
+    # End: New fields from Product
+
+    order = models.ForeignKey(
+        Order, related_name="items", verbose_name="Pedido", on_delete=models.CASCADE
+    )
+    parent = models.ForeignKey(
+        "self",
+        related_name="child",
+        verbose_name="Item pai",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    product = models.ForeignKey(
+        Product, verbose_name="Produto", on_delete=models.SET_NULL, null=True
+    )
+    sku = models.CharField(verbose_name="SKU", max_length=100, null=True, blank=True)
+    barcode = models.CharField(
+        verbose_name="barcode", max_length=100, null=True, blank=True
+    )
+    reference = models.ForeignKey(
+        GalleryReference,
+        verbose_name="Referência",
+        on_delete=models.SET_NULL,
+        null=True,
+    )
+    bulk = models.BooleanField(verbose_name="Granel", null=True, blank=True)
+    bulk_price = models.DecimalField(
+        verbose_name="Preço KG",
+        max_digits=11,
+        decimal_places=3,
+        blank=True,
+        null=True,
+        help_text="KG ou g ( Variação por empresa )",
+    )
+    bulk_low_price = models.DecimalField(
+        verbose_name="Preço KG promo.",
+        max_digits=11,
+        decimal_places=3,
+        blank=True,
+        null=True,
+        help_text="KG ou g ( Variação por empresa )",
+    )
+    bulk_portion = models.IntegerField(
+        verbose_name="Porção a granel ( gramas )", default=0, blank=True, null=True
+    )
+    initial_quantity = models.IntegerField(
+        verbose_name="Quant. Adquirida", null=True, blank=True
+    )
+    quantity = models.IntegerField(verbose_name="Quant. Final")
+    initial_price = models.DecimalField(
+        verbose_name="Preço Adquirido",
+        max_digits=11,
+        decimal_places=3,
+        blank=True,
+        null=True,
+    )
+    campaign_item = models.ForeignKey(
+        "campaigns.CampaignItem",
+        related_name="order_items",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    quantity_with_discount = models.IntegerField(
+        verbose_name="Quant. Com Desconto", default=0
+    )
+    price_with_discount = models.DecimalField(
+        verbose_name="Preço Com Desconto",
+        max_digits=11,
+        decimal_places=2,
+        blank=True,
+        null=True,
+    )
+    price = models.DecimalField(
+        verbose_name="Preço Final",
+        max_digits=11,
+        decimal_places=3,
+        blank=True,
+        null=True,
+    )
+    commission = models.DecimalField(
+        verbose_name="Comissão parceiro mais",
+        max_digits=11,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    # collect
+    collected = models.BooleanField("Coletado", default=False)
+    collected_at = models.DateTimeField(
+        verbose_name="Coletado às", blank=True, null=True, default=None
+    )
+    bulk_collection_started = models.BooleanField(
+        "Coleta Granel Iniciada", default=False
+    )
+    pre_collected = models.BooleanField("Pré Coletado", default=False)
+    delivery_tax = models.DecimalField(
+        "Taxa de entrega", max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    delivery_tax_discount = models.DecimalField(
+        "Desconto na taxa de entrega",
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    delivery_tax_total = models.DecimalField(
+        "Taxa de entrega final", max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    product_replaced = models.UUIDField("Produto substituido", blank=True, null=True)
+    replaced_by = models.UUIDField("substituido por", blank=True, null=True)
+    quantity_refound = models.IntegerField(
+        verbose_name="Quantidade de Itens estornados", default=0
+    )
+    delivery_state = models.CharField(
+        verbose_name="Estado de precificação",
+        max_length=25,
+        blank=True,
+        null=True,
+        choices=br_states.STATE_CHOICES,
+    )
+    gmcore_campaign_id = models.CharField(
+        verbose_name="Id da campanha do GMCore", max_length=100, null=True, blank=True
+    )
+    campaign_data = JSONField("Dados da campanha", null=True, encoder=DjangoJSONEncoder)
+
+    objects = OrderItemManager()
+
+    class Meta:
+        verbose_name = "Item"
+        verbose_name_plural = "Itens"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["order", "product", "reference"],
+                condition=models.Q(deleted=False) & models.Q(product__isnull=False),
+                name="unique_order_product_no_deleted",
+            )
+        ]
+        ordering = ("-created_at",)
+
+    def __str__(self):
+        return f"Sku: {self.sku} - Código de barras: {self.barcode}"
+
+    def delete(self, force=False):
+        if force:
+            return super().delete()
+
+        self.deleted = True
+        self.deleted_at = timezone.now()
+        self.save()
+
+        OrderAdditional.objects.filter(
+            order_id=self.order_id, product_id=self.product_id
+        ).delete()
+
+    def reset(self, save=False):
+        self.quantity = self.initial_quantity
+        self.price = self.initial_price
+        self.bulk_collection_started = False
+        self.collected_at = None
+        self.collected = False
+
+        if hasattr(self, "ocurrence"):
+            ocurrence = Ocurrence.objects_all.get(id=self.ocurrence.id)
+            ocurrence.delete(force=True)
+
+        if save:
+            self.save()
+
+    def get_calculated_commission(self):
+        return round(
+            self.product.get_commission_percent() * self.total / Decimal(100), 2
+        )
+
+    @property
+    def _price(self):
+        _price = self.price
+        try:
+            if self.child.exists():
+                product_algolia = SearchAlgolia().get_object_id_algolia(self.product.id)
+                if product_algolia["_current_price"] == _price:
+                    ...
+                else:
+                    for child in self.child.all():
+                        _price += child.price
+            return _price
+
+        except Exception as err:
+            return _price
+
+    @property
+    def total(self, *args, **kwargs):
+        return self.quantity * self._price
+
+    @property
+    def bulk_weight(self):
+        if not self.bulk and not self.bulk_portion:
+            return None
+
+        bulk_portion = self.bulk_portion
+        bulk_price = self.initial_price
+        bulk_price_final = self.price
+
+        if bulk_price_final != bulk_price:
+            calc_result = (bulk_price_final * bulk_portion) / bulk_price
+            return calc_result  # fix for market calculation
+
+        return bulk_portion * self.quantity
+
+    def get_bulk_price(self):
+        if self.bulk_low_price:
+            return self.bulk_low_price
+        return self.bulk_price
+
+    def update_product_data(self, force=False, force_price=None):
+        if self.order.status == OrderTrack.STATUS_CART or force:
+            return update_order_item_product_data(
+                self, self.order, force_price=force_price
+            )
+
+    @property
+    def quantity_max_for_refound(self) -> int:
+        quantity = self.quantity - self.quantity_refound
+        if quantity <= 0:
+            return 0
+        return self.quantity - self.quantity_refound
+
+
+class Ocurrence(BaseSuperModel, occurence_mixins.ActionsMixin):
+    REASON_CHOICES = (
+        ("MISSING_PRODUCT", "Produto em falta"),
+        ("RETURN_PRODUCT", "Problema com produto (estorno)"),
+        ("PARTIAL_CUT", "Corte parcial"),
+        ("OTHER", "Outro motivo"),
+    )
+
+    order_item = models.OneToOneField(
+        OrderItem, verbose_name="Item do Pedido", on_delete=models.CASCADE
+    )
+    reason = models.CharField("Motivo", max_length=20, choices=REASON_CHOICES)
+    note = models.TextField("Observação", null=True, blank=True)
+    action = models.CharField(
+        "Ação", max_length=30, choices=occurence_mixins.ActionsMixin.ACTION_CHOICES
+    )
+
+    class Meta:
+        verbose_name = "Ocorrência"
+        verbose_name_plural = "Ocorrências"
+        get_latest_by = "created_at"
+
+    def __str__(self):
+        return f"Item do pedido: {self.order_item_id} | Motivo: {self.get_reason_display()} | Ação: {self.get_action_display()}."
+
+
+class OrderAdditional(BaseSuperModel):
+    order = models.ForeignKey(
+        Order,
+        related_name="additionals",
+        verbose_name="pedido",
+        on_delete=models.CASCADE,
+    )
+    additional = models.ForeignKey(
+        "products.Additional",
+        verbose_name="adicional",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    product = models.ForeignKey(
+        "partners.Product", verbose_name="product", on_delete=models.CASCADE
+    )
+    name = models.CharField(verbose_name="nome", max_length=255)
+    description = models.TextField(verbose_name="descrição", blank=True)
+    quantity = models.PositiveIntegerField(
+        verbose_name="quantidade", default=1, null=True, blank=True
+    )
+    price = models.DecimalField(
+        verbose_name="Preço", max_digits=11, decimal_places=3, default=0
+    )
+
+    class Meta:
+        verbose_name = "Adicional"
+        verbose_name_plural = "Adicionais"
+
+
+class OrderDiscountTypes(IntEnum):
+    REVERSAL = 0
+
+    @classmethod
+    def choices(cls):
+        return [(key.value, key.name) for key in cls]
+
+    @classmethod
+    def get_description(cls, status):
+        return {cls.REVERSAL: "Estorno",}[status]
+
+
+class OrderLogisticObject(BaseSuperModel):
+    order = models.ForeignKey(
+        Order, on_delete=models.CASCADE, null=False, related_name="logistic_objects"
+    )
+    code = models.CharField(max_length=100, null=False, blank=False)
+    volumes = ArrayField(models.CharField(max_length=255), blank=True)
+
+    class Meta:
+        verbose_name = "Objeto de logística"
+        verbose_name_plural = "Objetos de logística"
+
+
+class OrderShippingAddress(BaseSuperModel):
+    order = models.OneToOneField(
+        "orders.Order",
+        verbose_name="Pedido",
+        on_delete=models.CASCADE,
+        related_name="delivery_address_order",
+    )
+    state = models.CharField(
+        verbose_name="Estado", choices=STATE_CHOICES, max_length=255
+    )
+    city = models.CharField(verbose_name="Cidade", max_length=255)
+    street = models.CharField(verbose_name="Endereço", max_length=255)
+    number = models.IntegerField(verbose_name="Número", blank=True, null=True)
+    complement = models.CharField(
+        verbose_name="Complemento", max_length=150, blank=True
+    )
+    district = models.CharField(verbose_name="Bairro", max_length=100, blank=True)
+    zipcode = models.CharField(verbose_name="CEP", max_length=20)
+    coordinates = point.PointField(
+        srid=4326, verbose_name="Coordenadas", null=True, blank=True
+    )
+
+    @property
+    def full_address(self):
+        return "{0} {1} {2} - {3} - {4} - {5} - {6}".format(
+            self.street,
+            self.number,
+            self.complement,
+            self.district,
+            self.city,
+            self.state,
+            self.zipcode,
+        )
+
+
+class OrderResellerBillingDeadline(BaseSuperModel):
+    """Represents a B2B reseller order billing deadline class model"""
+
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, null=False)
+    code = models.CharField(
+        max_length=100, null=False, blank=False, verbose_name="Código externo"
+    )
+    description = models.TextField(
+        max_length=120, null=False, blank=False, verbose_name="Descrição"
+    )
+
+    class Meta:
+        verbose_name = "Prazo de faturamento do pedido"
+        verbose_name_plural = "Prazos de faturamento do pedido"
+
+
+
